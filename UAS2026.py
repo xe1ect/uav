@@ -25,28 +25,52 @@ class GEO:
         return new_lat, new_lon
     
     @staticmethod
-    def tranform(templete_wps, current_lat, current_lon):
+    def tranform(templete_wps, current_lat, current_lon, manual_ref=None):
         new_wps = []
         
-        if len(templete_wps[0]) ==3:
-            ref_lat, ref_lon, _ = templete_wps[0]
-        else:
-            ref_lat, ref_lon = templete_wps[0]
-        for item in templete_wps:
-            if len(item) ==3:
-                lat, lon, alt= item
+        def unpack_wp(wp):
+            if len(wp) == 2 and isinstance(wp[0], (list, tuple)):
+                return float(wp[0][0]), float(wp[0][1]), float(wp[1])
+            elif len(wp) >= 3:
+                return float(wp[0]), float(wp[1]), float(wp[2])
             else:
-                lat, lon = item
-                alt= None
+                return float(wp[0]), float(wp[1]), None
+            
+        if manual_ref:
+             ref_lat, ref_lon = manual_ref[0], manual_ref[1]
+        else:
+
+             ref_lat, ref_lon, _ = unpack_wp(templete_wps[0])
+            
+        for item in templete_wps:
+            lat, lon, alt = unpack_wp(item)
             
             n_off, e_off = GEO.get_offset(ref_lat, ref_lon, lat, lon)
-            new_lat,new_lon = GEO.apply(current_lat, current_lon, n_off, e_off)
+            new_lat, new_lon = GEO.apply(current_lat, current_lon, n_off, e_off)
+            
             if alt is not None:
-                new_wps.append((new_lat, new_lon,alt))
+                new_wps.append((new_lat, new_lon, alt))
             else:
                 new_wps.append((new_lat, new_lon))
             
         return new_wps
+    
+    @staticmethod
+    def get_point(lat, lon, bearing_deg, distance_m):
+        rad = math.radians(bearing_deg)
+
+        north_m= distance_m * math.cos(rad)
+        east_m= distance_m * math.sin(rad)
+        
+        return GEO.apply(lat, lon, north_m, east_m)
+    
+    @staticmethod
+    def get_bearing(lat1, lon1, lat2, lon2):
+        north_m, east_m = GEO.get_offset(lat1, lon1, lat2, lon2)
+        bearing = math.degrees(math.atan2(east_m, north_m))
+        if bearing < 0:
+            bearing += 360
+        return bearing
     
 class UAV:
     def __init__(self, connection_string,baud=57600):
@@ -75,8 +99,16 @@ class UAV:
                 if int(time.time()) %2 ==0:
                     print(".",end="",flush=True)
                 time.sleep(0.5)
+
+    def get_heading(self):
+        for _ in range(10):
+            msg = self.master.recv_match(type='VFR_HUD', blocking=True, timeout=1)
+            if msg:
+                return msg.heading
+            time.sleep(0.1)
+        return 0
     
-    def set_param_verify(self, param_id, param_value, param_type):
+    """def set_param_verify(self, param_id, param_value, param_type):
         
         # แปลง Input param_id ให้เป็น String และ Bytes เพื่อใช้แยกกัน
         if isinstance(param_id, bytes):
@@ -96,7 +128,7 @@ class UAV:
             
             time.sleep(0.2)
         return True
-    
+    """
     def get_altitude(self):
         msg = self.master.recv_match(type='GLOBAL_POSITION_INT', blocking=True, timeout=2)
         if msg:
@@ -123,22 +155,26 @@ class UAV:
                     return True
             time.sleep(0.5)
         return False
-            
-    def arm_check(self):
-        self.set_param_verify(b'ARMING_CHECK', 0, mavutil.mavlink.MAV_PARAM_TYPE_INT32)
+          
+    """def arm_check(self):
+        self.set_param_verify(b'ARMING_CHECK', 0, mavutil.mavlink.MAV_PARAM_TYPE_INT32)"""
     
-    def get_forward_point(self, lat, lon, distance=100):
-        new_lat, new_lon = GEO.apply(lat, lon, distance, 0)
+    def get_forward_point(self, lat, lon, heading, distance=100):
+        new_lat, new_lon = GEO.apply(lat, lon,heading, distance)
         return new_lat, new_lon
     
-    def upload_mission(self, waypoints, takeoff_alt=40,altitude=40, add_landing=True, land_lat=None, land_lon=None):
+    def upload_mission(self, loop_wp, drop_wp,loop_alt=40,drop_alt=6,altitude=40, land_lat=None, land_lon=None,descent_dist=250):
         if not self.master: raise Exception("UAV not connected")
+        
+        current_heading= self.get_heading()
         
         print("Clearing old mission")
         self.master.mav.mission_clear_all_send(self.system_id, self.component_id)
         self.master.recv_match(type=['MISSION_ACK'], blocking=True, timeout=3)
         mission_items = []
         seq=0
+        
+        home_lat, home_lon = loop_wp[0][0], loop_wp[0][1]
         
         mission_items.append(mavutil.mavlink.MAVLink_mission_item_int_message(
             self.system_id, self.component_id, seq,
@@ -152,7 +188,7 @@ class UAV:
 
         hand_off=15
         
-        climb_lat, climb_lon = self.get_forward_point(land_lat, land_lon, distance=50)
+        climb_lat, climb_lon = self.get_forward_point(land_lat, land_lon, current_heading, distance=50)
         
         mission_items.append(mavutil.mavlink.MAVLink_mission_item_int_message(
             self.system_id, self.component_id, seq,
@@ -166,29 +202,45 @@ class UAV:
         ))
         seq+=1
         
-        if len(waypoints[0]) ==3:
-            first_wp_lat, first_wp_lon, _ = waypoints[0]
-        else:
-            first_wp_lat, first_wp_lon = waypoints[0]
+        far_dist = 300
+        far_lat, far_lon = self.get_forward_point(land_lat, land_lon, current_heading, distance=far_dist)
         
-        for data in waypoints:
-            if len(data) == 3:
-                lat, lon, alt= data
-            else:
-                lat, lon = data
-                alt = altitude
-            msg = mavutil.mavlink.MAVLink_mission_item_int_message(
+        mission_items.append(mavutil.mavlink.MAVLink_mission_item_int_message(
+            self.system_id, self.component_id, 0,
+            mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+            mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+            0, 1, 10, 0, 0, 0,
+            int(far_lat * 1e7), int(far_lon * 1e7),
+            30
+        ))
+        
+        for i, wp in enumerate(loop_wp):
+            lat, lon = wp[0], wp[1]
+            mission_items.append(mavutil.mavlink.MAVLink_mission_item_int_message(
                 self.system_id, self.component_id, seq,
-                mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
-                mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
-                0, 1,
-                0, 0, 0, 0,
-                int(lat * 1e7), int(lon * 1e7),
-                float(alt)
-            )
-            mission_items.append(msg)
-            seq +=1
-            
+                mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT, mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+                0, 0, 0, 0, 0, 0, int(lat*1e7), int(lon*1e7), float(loop_alt)
+            ))
+            seq += 1
+        
+        drop_lat, drop_lon = drop_wp[0][0], drop_wp[0][1]
+        
+        mission_items.append(mavutil.mavlink.MAVLink_mission_item_int_message(
+            self.system_id, self.component_id, seq,
+            mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT, mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+            0, 0, 0, 0, 0, 0, int(drop_lat*1e7), int(drop_lon*1e7), float(drop_alt)
+        ))
+        seq += 1
+        
+        for i, wp in enumerate(drop_wp):
+            lat, lon = wp[0], wp[1]
+            mission_items.append(mavutil.mavlink.MAVLink_mission_item_int_message(
+                self.system_id, self.component_id, seq,
+                mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT, mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+                0, 0, 0, 0, 0, 0, int(lat*1e7), int(lon*1e7), float(drop_alt)
+            ))
+            seq += 1
+        
         mission_items.append(mavutil.mavlink.MAVLink_mission_item_int_message(
             self.system_id, self.component_id, seq,
             mavutil.mavlink.MAV_FRAME_MISSION,
@@ -197,7 +249,7 @@ class UAV:
         ))
         seq +=1
         
-        approach_lat, approach_lon = GEO.apply(home_lat,home_lon, 300, 0)
+        approach_lat, approach_lon = GEO.apply(home_lat,home_lon, 100, 0)
 
         mission_items.append(mavutil.mavlink.MAVLink_mission_item_int_message(
             self.system_id, self.component_id, seq,
@@ -206,7 +258,7 @@ class UAV:
             0, 1,
             0, 0, 0, 0,
             int(approach_lat * 1e7), int(approach_lon * 1e7),
-            30
+            20
         ))
         seq +=1
         
@@ -298,10 +350,12 @@ if __name__ == "__main__":
         (52.781224, -0.709372, 40), (52.782885, -0.710350, 40),
         (52.782032, -0.710870, 40), (52.782783, -0.708481, 40),
         (52.783655, -0.710516, 40), (52.781427, -0.712204, 40),
-        (52.782054, -0.707315, 20), (52.781395, -0.706479, 15),
+        (52.782054, -0.707315, 40), (52.781395, -0.706479, 40)
+    ]
+    
+    DROP_WPS = [
         (52.780940, -0.708120, 6), (52.780940, -0.708370,  6),
-        (52.780920, -0.708620,  6), (52.780900, -0.708870,  6)
-
+        (52.780920, -0.708620,  6)
     ]
     
     try:
@@ -310,11 +364,16 @@ if __name__ == "__main__":
         
         home_lat, home_lon = drone.get_connection_info()
         
-        drone.arm_check()
+        #drone.arm_check()
         
         local_mission = GEO.tranform(TEMPLETE_WPS, home_lat, home_lon)
         
-        total= drone.upload_mission(local_mission,takeoff_alt=40,altitude=40, land_lat=float(home_lat), land_lon=float(home_lon))
+        loop_ref_lat = TEMPLETE_WPS[0][0]
+        loop_ref_lon = TEMPLETE_WPS[0][1]
+        
+        drop_mission = GEO.tranform(DROP_WPS, home_lat, home_lon, manual_ref=(loop_ref_lat, loop_ref_lon))
+        
+        total= drone.upload_mission(local_mission,drop_mission, land_lat=float(home_lat), land_lon=float(home_lon))
         
         time.sleep(2)
         drone.start_mission(total_items=total)

@@ -25,7 +25,7 @@ class GEO:
         return new_lat, new_lon
     
     @staticmethod
-    def tranform(templete_wps, current_lat, current_lon, manual_ref=None):
+    def tranform(templete_wps, current_lat, current_lon, heading_deg=0, manual_ref=None):
         new_wps = []
         
         def unpack_wp(wp):
@@ -46,7 +46,8 @@ class GEO:
             lat, lon, alt = unpack_wp(item)
             
             n_off, e_off = GEO.get_offset(ref_lat, ref_lon, lat, lon)
-            new_lat, new_lon = GEO.apply(current_lat, current_lon, n_off, e_off)
+            #n_rot, e_rot = GEO.rotate_point(n_off, e_off, heading_deg)  # No rotation applied
+            new_lat, new_lon = GEO.apply(current_lat, current_lon, n_off,e_off)
             
             if alt is not None:
                 new_wps.append((new_lat, new_lon, alt))
@@ -108,33 +109,24 @@ class UAV:
             time.sleep(0.1)
         return 0
     
-    """def set_param_verify(self, param_id, param_value, param_type):
-        
-        # แปลง Input param_id ให้เป็น String และ Bytes เพื่อใช้แยกกัน
-        if isinstance(param_id, bytes):
-            param_id_bytes = param_id
-            param_id_str = param_id.decode()
-        else:
-            param_id_bytes = param_id.encode('utf-8')
-            param_id_str = param_id
-
-        print(f"Setting {param_id_str} to {param_value}...")
-        
-        for i in range(5):
-            self.master.mav.param_set_send(
-                self.system_id, self.component_id,
-                param_id_bytes, param_value, param_type
-            )
-            
-            time.sleep(0.2)
-        return True
-    """
+    """def force_alt(self, target_alt):
+        self.master.mav.command_long_send(
+            self.system_id, self.component_id,
+            mavutil.mavlink.MAV_CMD_DO_CHANGE_ALTITUDE,
+            0,
+            float(target_alt), 0, 0, 0, 0, 0, 0
+        )"""
+    
     def get_altitude(self):
         msg = self.master.recv_match(type='GLOBAL_POSITION_INT', blocking=True, timeout=2)
         if msg:
             return msg.relative_alt / 1000.0 # mm to meters
         return 0.0
 
+    def get_distance(lat1, lon1, lat2, lon2):
+        north,east = GEO.get_offset(lat1, lon1, lat2, lon2)
+        return math.sqrt(north**2 + east**2)
+    
     def set_mode(self, mode):
         if mode not in self.master.mode_mapping():
             return False
@@ -155,18 +147,19 @@ class UAV:
                     return True
             time.sleep(0.5)
         return False
-          
-    """def arm_check(self):
-        self.set_param_verify(b'ARMING_CHECK', 0, mavutil.mavlink.MAV_PARAM_TYPE_INT32)"""
+    
     
     def get_forward_point(self, lat, lon, heading, distance=100):
-        new_lat, new_lon = GEO.apply(lat, lon,heading, distance)
+        new_lat, new_lon = GEO.get_point(lat, lon,heading, distance)
         return new_lat, new_lon
     
-    def upload_mission(self, loop_wp, drop_wp,loop_alt=40,drop_alt=6,altitude=40, land_lat=None, land_lon=None,descent_dist=250):
+    def upload_mission(self, loop_wp, drop_wp,loop_alt=45,drop_alt=6,altitude=40, land_lat=None, land_lon=None,descent_dist=250,target_bearing=247.0):
         if not self.master: raise Exception("UAV not connected")
         
+        
         current_heading= self.get_heading()
+        #target_bearing= GEO.get_bearing(land_lat, land_lon, loop_wp[0][0], loop_wp[0][1])
+        #print(target_bearing)
         
         print("Clearing old mission")
         self.master.mav.mission_clear_all_send(self.system_id, self.component_id)
@@ -184,38 +177,43 @@ class UAV:
             int(land_lat * 1e7), int(land_lon * 1e7),
             0
         ))
-        seq += 1   
-
-        hand_off=15
         
-        climb_lat, climb_lon = self.get_forward_point(land_lat, land_lon, current_heading, distance=50)
+        hand_off=30
+        climb_lat, climb_lon = self.get_forward_point(land_lat, land_lon, target_bearing, distance=100)
         
         mission_items.append(mavutil.mavlink.MAVLink_mission_item_int_message(
             self.system_id, self.component_id, seq,
             mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
             mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
             0, 1,
-            10,
+            30,
             0, 0, 0, 
             int(climb_lat * 1e7), int(climb_lon * 1e7),
             float(hand_off)
         ))
-        seq+=1
+        seq = 2
         
-        far_dist = 300
+        """far_dist = 130
         far_lat, far_lon = self.get_forward_point(land_lat, land_lon, current_heading, distance=far_dist)
         
         mission_items.append(mavutil.mavlink.MAVLink_mission_item_int_message(
             self.system_id, self.component_id, 0,
             mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
             mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
-            0, 1, 10, 0, 0, 0,
+            0, 1, 30, 0, 0, 0,
             int(far_lat * 1e7), int(far_lon * 1e7),
             30
-        ))
+        ))"""
         
-        for i, wp in enumerate(loop_wp):
+        last_loop_lat = 0
+        last_loop_lon = 0
+        
+        #for i in range(0,2):
+        for i, wp in enumerate(loop_wp[1:]):
             lat, lon = wp[0], wp[1]
+            last_loop_lat = lat 
+            last_loop_lon = lon
+            
             mission_items.append(mavutil.mavlink.MAVLink_mission_item_int_message(
                 self.system_id, self.component_id, seq,
                 mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT, mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
@@ -223,44 +221,52 @@ class UAV:
             ))
             seq += 1
         
-        drop_lat, drop_lon = drop_wp[0][0], drop_wp[0][1]
+        #drop_lat, drop_lon = drop_wp[0][0], drop_wp[0][1]
+        
+        """mission_items.append(mavutil.mavlink.MAVLink_mission_item_int_message(
+            self.system_id, self.component_id, seq,
+            mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT, mavutil.mavlink.MAV_CMD_NAV_LOITER_TO_ALT,
+            0, 1, 0, 40, 0, 1, int(drop_wp[0][0]), int(drop_wp[0][1]), float(drop_alt)
+        ))
+        seq+=1"""
+
+        """first_drop_lat = drop_wp[0][0]
+        first_drop_lon = drop_wp[0][1]
+        
+        dive_ratio = 0.2
+        
+        d_lat = first_drop_lat - last_loop_lat
+        d_lon = first_drop_lon - last_loop_lon
+        
+        dive_lat = last_loop_lat + (d_lat * dive_ratio)
+        dive_lon = last_loop_lon + (d_lon * dive_ratio)
         
         mission_items.append(mavutil.mavlink.MAVLink_mission_item_int_message(
             self.system_id, self.component_id, seq,
-            mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT, mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
-            0, 0, 0, 0, 0, 0, int(drop_lat*1e7), int(drop_lon*1e7), float(drop_alt)
+            mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT, 
+            mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+            0, 0, 0, 0, 0, 0, 
+            int(dive_lat * 1e7), int(dive_lon * 1e7), 
+            float(drop_alt) # <<< บังคับลงต่ำตรงนี้
         ))
-        seq += 1
+        seq += 1"""
         
         for i, wp in enumerate(drop_wp):
             lat, lon = wp[0], wp[1]
+            """if i==0:
+                mission_items.append(mavutil.mavlink.MAVLink_mission_item_int_message(
+                    self.system_id, self.component_id, seq,
+                    mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT, mavutil.mavlink.MAV_CMD_NAV_LOITER_TO_ALT,
+                    0, 1, 0, 40, 0, 1, int(lat*1e7), int(lon*1e7), float(drop_alt)
+                ))
+                seq+=1"""
+            
             mission_items.append(mavutil.mavlink.MAVLink_mission_item_int_message(
                 self.system_id, self.component_id, seq,
                 mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT, mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
                 0, 0, 0, 0, 0, 0, int(lat*1e7), int(lon*1e7), float(drop_alt)
             ))
             seq += 1
-        
-        mission_items.append(mavutil.mavlink.MAVLink_mission_item_int_message(
-            self.system_id, self.component_id, seq,
-            mavutil.mavlink.MAV_FRAME_MISSION,
-            mavutil.mavlink.MAV_CMD_DO_LAND_START,
-            0, 1, 0, 0, 0, 0, 0, 0, 0
-        ))
-        seq +=1
-        
-        approach_lat, approach_lon = GEO.apply(home_lat,home_lon, 100, 0)
-
-        mission_items.append(mavutil.mavlink.MAVLink_mission_item_int_message(
-            self.system_id, self.component_id, seq,
-            mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
-            mavutil.mavlink.MAV_CMD_NAV_LOITER_TO_ALT,
-            0, 1,
-            0, 0, 0, 0,
-            int(approach_lat * 1e7), int(approach_lon * 1e7),
-            20
-        ))
-        seq +=1
         
         mission_items.append(mavutil.mavlink.MAVLink_mission_item_int_message(
             self.system_id, self.component_id, seq,
@@ -346,38 +352,127 @@ class UAV:
         
 if __name__ == "__main__":
     TEMPLETE_WPS = [
-        (52.779867, -0.712086, 40), (52.780494, -0.712729, 40),
-        (52.781224, -0.709372, 40), (52.782885, -0.710350, 40),
-        (52.782032, -0.710870, 40), (52.782783, -0.708481, 40),
-        (52.783655, -0.710516, 40), (52.781427, -0.712204, 40),
-        (52.782054, -0.707315, 40), (52.781395, -0.706479, 40)
-    ]
-    
+    (0.0, 0.0, 45.0),
+    (52.7802127, -0.7094389, 45.0),
+    (52.7801219, -0.7106915, 45.0),
+    (52.7799807, -0.711696, 45.0),
+    (52.7799588, -0.7118154, 45.0),
+    (52.7799571, -0.7119414, 45.0),
+    (52.7799912, -0.7120474, 45.0),
+    (52.780063, -0.7120507, 45.0),
+    (52.7801291, -0.7120071, 45.0),
+    (52.7811893, -0.7126951, 45.0),
+    (52.7813548, -0.712852, 45.0),
+    (52.7813994, -0.7129459, 45.0),
+    (52.7814684, -0.7129285, 45.0),
+    (52.7814943, -0.7128178, 45.0),
+    (52.7814453, -0.7127253, 45.0),
+    (52.7821692, -0.7076392, 45.0),
+    (52.7821652, -0.7075144, 45.0),
+    (52.7821778, -0.7073971, 45.0),
+    (52.7822203, -0.7072985, 45.0),
+    (52.7822901, -0.7073287, 45.0),
+    (52.7823124, -0.7074427, 45.0),
+    (52.7837133, -0.7088388, 45.0),
+    (52.7837749, -0.708873, 45.0),
+    (52.783418, -0.7088656, 45.0),
+    (52.7839108, -0.7088904, 45.0),
+    (52.783957, -0.7089789, 45.0),
+    (52.7839124, -0.7090701, 45.0),
+    (52.7838422, -0.7090996, 45.0),
+    (52.7828076, -0.7108471, 45.0),
+    (52.7827857, -0.7109617, 45.0),
+    (52.7827744, -0.711069, 45.0),
+    (52.7827484, -0.7111401, 45.0),
+    (52.782705, -0.7111736, 45.0),
+    (52.7826559, -0.7111508, 45.0),
+    (52.7826235, -0.7110885, 45.0),
+    (52.7826231, -0.7110033, 45.0),
+    (52.7826458, -0.7109322, 45.0),
+    (52.7826805, -0.7108786, 45.0),
+    (52.7832047, -0.7071027, 45.0),
+    (52.7831893, -0.70698, 45.0),
+    (52.7831848, -0.70686, 45.0),
+    (52.7831978, -0.7067406, 45.0),
+    (52.7832679, -0.7067044, 45.0),
+    (52.7833215, -0.7067855, 45.0),
+    (52.7833401, -0.7068989, 45.0),
+    (52.7847292, -0.7095811, 45.0),
+    (52.7847758, -0.709675, 45.0),
+    (52.7848476, -0.7096555, 45.0),
+    (52.7848938, -0.7097487, 45.0),
+    (52.7848679, -0.7098607, 45.0),
+    (52.7847969, -0.7098768, 45.0),
+    (52.7822536, -0.711987, 45.0),
+    (52.7820589, -0.712207, 45.0),
+    (52.7820289, -0.7123089, 45.0),
+    (52.7819567, -0.7123256, 45.0),
+    (52.7819153, -0.7122264, 45.0),
+    (52.7819458, -0.7121178, 45.0),
+    (52.7819879, -0.7120199, 45.0),
+    (52.7830185, -0.7070464, 45.0),
+    (52.7830627, -0.7069498, 45.0),
+    (52.783124, -0.7068841, 45.0),
+    (52.7831479, -0.7067695, 45.0),
+    (52.7830984, -0.7066796, 45.0),
+    (52.7830433, -0.7065991, 45.0),
+    (52.7818156, -0.7036266, 45.0),
+    (52.7818099, -0.7035019, 45.0),
+    (52.7817904, -0.7033879, 45.0),
+    (52.7817509, -0.7032829, 45.0),
+    (52.7816781, -0.70329, 45.0),
+    (52.7816464, -0.7034019, 45.0),
+    (52.7816541, -0.7035226, 45.0)
+]
     DROP_WPS = [
-        (52.780940, -0.708120, 6), (52.780940, -0.708370,  6),
-        (52.780920, -0.708620,  6)
-    ]
+    (52.7810466, -0.7068801, 6),
+    (52.7808827, -0.7075024, 6)
+]
     
     try:
         drone = UAV("udp:127.0.0.1:14550")
         drone.connect()
         
-        home_lat, home_lon = drone.get_connection_info()
+        time.sleep(2)
         
+        home_lat, home_lon = drone.get_connection_info()
+        current_heading = drone.get_heading()
         #drone.arm_check()
         
-        local_mission = GEO.tranform(TEMPLETE_WPS, home_lat, home_lon)
+        local_mission = GEO.tranform(TEMPLETE_WPS, home_lat, home_lon, heading_deg=current_heading)
         
         loop_ref_lat = TEMPLETE_WPS[0][0]
         loop_ref_lon = TEMPLETE_WPS[0][1]
         
-        drop_mission = GEO.tranform(DROP_WPS, home_lat, home_lon, manual_ref=(loop_ref_lat, loop_ref_lon))
+        drop_mission = GEO.tranform(DROP_WPS, home_lat, home_lon, heading_deg=current_heading, manual_ref=(loop_ref_lat, loop_ref_lon))
         
         total= drone.upload_mission(local_mission,drop_mission, land_lat=float(home_lat), land_lon=float(home_lon))
         
         time.sleep(2)
         drone.start_mission(total_items=total)
         
+        """while True:
+            drone.master.mav.heartbeat_send(mavutil.mavlink.MAV_TYPE_GCS, 
+                                            mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
+            msg = drone.master.recv_match(type="MISSION_CURRENT", blocking=True, timeout=1)
+            if msg:
+                current_wp = msg.seq
+                
+                if current_wp >= 12:
+                    curr_pos = drone.master.recv_match(type="GLOBAL_POSITION_INT", blocking=True, timeout=1)
+                    if curr_pos:
+                        curr_lat = curr_pos.lat / 1e7
+                        curr_lon = curr_pos.lon / 1e7
+
+                        target_lat, target_lon = drop_mission[-1][0], drop_mission[-1][1]
+                        dist = GEO.get_distance(curr_lat, curr_lon, target_lat, target_lon)
+
+                        if dist < 800:
+                            drone.force_alt(6)
+                            break
+                            
+                        
+            time.sleep(0.5)"""
     except Exception as e:
         print(f"Error: {e}")
         
